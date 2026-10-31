@@ -19,6 +19,7 @@ public:
         // clang-format off
         static const FunctionInfo functions[] = {
             {10, D<&IGraphicsScaleController::GetCurrentGraphicsScale>, "GetCurrentGraphicsScale"},
+            {1050, D<&IGraphicsScaleController::SetGraphicsScaleChangedNotificationEnabled>, "SetGraphicsScaleChangedNotificationEnabled"},
         };
         // clang-format on
         RegisterHandlers(functions);
@@ -28,6 +29,12 @@ private:
     Result GetCurrentGraphicsScale(Out<u32> out_scale) {
         LOG_WARNING(Service_AM, "(STUBBED) called, returning 10");
         *out_scale = 10;
+        R_SUCCEED();
+    }
+
+    // The scale never changes, so there is nothing to notify.
+    Result SetGraphicsScaleChangedNotificationEnabled(u32 enabled) {
+        LOG_DEBUG(Service_AM, "called, enabled={}", enabled);
         R_SUCCEED();
     }
 };

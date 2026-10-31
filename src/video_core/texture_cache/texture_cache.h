@@ -781,6 +781,28 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
 }
 
 template <class P>
+void TextureCache<P>::DebugDumpImages(DAddr cpu_addr, const std::string& prefix) {
+    boost::container::small_vector<ImageId, 4> images;
+    ForEachImageInRegion(cpu_addr, 1, [&](ImageId image_id, ImageBase& image) {
+        if (image.cpu_addr == cpu_addr) images.push_back(image_id);
+    });
+    for (const ImageId image_id : images) {
+        Image& image = slot_images[image_id];
+        auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
+        const auto copies = FullDownloadCopies(image.info);
+        image.DownloadMemory(map, copies);
+        runtime.Finish();
+        const std::string path = fmt::format("{}-{}x{}-f{}.bin", prefix, image.info.size.width,
+                                             image.info.size.height, static_cast<u32>(image.info.format));
+        if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
+            std::fwrite(map.mapped_span.data(), 1, image.unswizzled_size_bytes, file);
+            std::fclose(file);
+        }
+        LOG_INFO(HW_GPU, "debug dump {:#x} -> {}", cpu_addr, path);
+    }
+}
+
+template <class P>
 std::optional<VideoCore::RasterizerDownloadArea> TextureCache<P>::GetFlushArea(DAddr cpu_addr,
                                                                                u64 size) {
     std::optional<VideoCore::RasterizerDownloadArea> area{};
@@ -952,9 +974,6 @@ std::pair<typename P::ImageView*, bool> TextureCache<P>::TryFindFramebufferImage
     const Tegra::FramebufferConfig& config, DAddr cpu_addr) {
     // TODO: Properly implement this
     const auto it = page_table.find(cpu_addr >> YUZU_PAGEBITS);
-    if (it == page_table.end()) {
-        return {};
-    }
     const auto view_format = [&]() {
         switch (config.pixel_format) {
         case Service::android::PixelFormat::Rgb565:
@@ -966,8 +985,9 @@ std::pair<typename P::ImageView*, bool> TextureCache<P>::TryFindFramebufferImage
         }
     }();
 
-    const auto& image_map_ids = it->second;
     boost::container::small_vector<ImageId, 4> valid_image_ids;
+    static const std::vector<ImageMapId> no_image_map_ids;
+    const auto& image_map_ids = it != page_table.end() ? it->second : no_image_map_ids;
     for (const ImageMapId map_id : image_map_ids) {
         const ImageMapView& map = slot_map_views[map_id];
         const ImageBase& image = slot_images[map.image_id];
@@ -977,7 +997,13 @@ std::pair<typename P::ImageView*, bool> TextureCache<P>::TryFindFramebufferImage
         if (image.image_view_ids.empty()) {
             continue;
         }
-        if (!VideoCore::Surface::IsViewCompatible(image.info.format, view_format, false, true)) {
+        // Switch 2 titles present HDR10 windows (A2B10G10R10) through 8-bit window descriptions;
+        // show the render target in its own format rather than an empty RGBA8 alias of it.
+        const bool hdr_window = image.info.format == PixelFormat::A2B10G10R10_UNORM &&
+                                image.info.size.width == config.width &&
+                                image.info.size.height == config.height;
+        if (!hdr_window &&
+            !VideoCore::Surface::IsViewCompatible(image.info.format, view_format, false, true)) {
             static u32 rejected_alias_count{};
             if (std::getenv("EDEN_NATIVE_DRAW_DIAGNOSTICS") && rejected_alias_count++ < 8) {
                 LOG_WARNING(HW_GPU, "Ignoring incompatible framebuffer alias: address={:#x}, image={}, view={}",
@@ -989,7 +1015,10 @@ std::pair<typename P::ImageView*, bool> TextureCache<P>::TryFindFramebufferImage
     }
 
     const auto GetImageViewForFramebuffer = [&](ImageId image_id) {
-        ImageViewInfo info{ImageViewType::e2D, view_format};
+        const PixelFormat image_format = slot_images[image_id].info.format;
+        ImageViewInfo info{ImageViewType::e2D, image_format == PixelFormat::A2B10G10R10_UNORM
+                                                   ? image_format
+                                                   : view_format};
         if (config.blending == Tegra::BlendMode::Opaque) {
             info.x_source = static_cast<u8>(SwizzleSource::R);
             info.y_source = static_cast<u8>(SwizzleSource::G);
@@ -999,6 +1028,21 @@ std::pair<typename P::ImageView*, bool> TextureCache<P>::TryFindFramebufferImage
         return std::make_pair(&slot_image_views[FindOrEmplaceImageView(image_id, info)],
                               slot_images[image_id].IsRescaled());
     };
+
+    // Switch 2 maps the window memory once per GPU address space, at different device addresses;
+    // the game may have rendered through another one. Same memory means the same host pointer.
+    if (valid_image_ids.empty()) {
+        if (const u8* const host = device_memory.GetPointer<u8>(cpu_addr)) {
+            for (const auto [image_id, image] : slot_images) {
+                if (image->info.format == PixelFormat::A2B10G10R10_UNORM &&
+                    image->info.size.width == config.width &&
+                    image->info.size.height == config.height && !image->image_view_ids.empty() &&
+                    device_memory.GetPointer<u8>(image->cpu_addr) == host) {
+                    valid_image_ids.push_back(image_id);
+                }
+            }
+        }
+    }
 
     if (valid_image_ids.size() == 1) [[likely]] {
         return GetImageViewForFramebuffer(valid_image_ids.front());

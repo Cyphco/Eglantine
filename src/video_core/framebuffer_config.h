@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <array>
 #include <span>
 #include <vector>
 
@@ -38,6 +39,9 @@ struct FramebufferConfig {
     Common::Rectangle<int> crop_rect{};
     BlendMode blending{};
     bool native_tiling{};
+    /// Other device addresses of the same memory (Switch 2 maps it once per GPU address space);
+    /// the presenter uses whichever has the rendered image.
+    std::array<DAddr, 3> alternate_addresses{};
     u32 layer_stack_mask{Service::Nvnflinger::DefaultLayerStackMask};
 };
 

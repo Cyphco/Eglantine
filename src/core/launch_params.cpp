@@ -26,7 +26,7 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
     int option_index = 0;
     static struct option long_options[] = {
         // clang-format off
-        {"debug", no_argument, 0, 'd'},
+        {"debug", required_argument, 0, 'd'},
         {"config", required_argument, 0, 'c'},
         {"fullscreen", no_argument, 0, 'f'},
         {"help", no_argument, 0, 'h'},
@@ -44,7 +44,7 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
     };
 
     while (optind < argc) {
-        if (int arg = getopt_long(argc, argv, "dc:fhg:m:p:u:vinsx", long_options, &option_index); arg != -1) {
+        if (int arg = getopt_long(argc, argv, "d:c:fhg:m:p:u:vinsx", long_options, &option_index); arg != -1) {
             switch (char(arg)) {
             case 'd':
                 p.override_gdb_port = uint16_t(atoi(optarg));

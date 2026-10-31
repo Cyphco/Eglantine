@@ -90,8 +90,15 @@ void Layer::ConfigureDraw(const Device& device, PresentPushConstants* out_push_c
                           VkSampler sampler, size_t image_index,
                           const Tegra::FramebufferConfig& framebuffer,
                           const Layout::FramebufferLayout& layout) {
-    const auto texture_info = rasterizer.AccelerateDisplay(
+    auto texture_info = rasterizer.AccelerateDisplay(
         framebuffer, framebuffer.address + framebuffer.offset, framebuffer.stride);
+    for (const DAddr alternate : framebuffer.alternate_addresses) {
+        if (texture_info || alternate == 0) {
+            break;
+        }
+        texture_info =
+            rasterizer.AccelerateDisplay(framebuffer, alternate + framebuffer.offset, framebuffer.stride);
+    }
     const u32 texture_width = texture_info ? texture_info->width : framebuffer.width;
     const u32 texture_height = texture_info ? texture_info->height : framebuffer.height;
     const u32 scaled_width = texture_info ? texture_info->scaled_width : texture_width;

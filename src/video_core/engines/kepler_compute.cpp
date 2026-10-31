@@ -7,12 +7,14 @@
 #include <algorithm>
 #include <atomic>
 #include <bitset>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 #include "common/assert.h"
 #include "common/logging.h"
 #include "shader_recompiler/exception.h"
@@ -427,7 +429,8 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             std::ofstream registers("native-dispatch-registers.bin", std::ios::binary);
             registers.write(reinterpret_cast<const char*>(native_registers.data()), sizeof(native_registers));
         }
-        LOG_ERROR(HW_GPU, "Native compute dispatch unsupported: method={:#x}, value={:#x}, QMD={:#x}, words={:08x}", method, argument,
+        // The QMD words only matter when debugging a dispatch; the line above already names the failure.
+        LOG_DEBUG(HW_GPU, "Native compute dispatch unsupported: method={:#x}, value={:#x}, QMD={:#x}, words={:08x}", method, argument,
                   qmd_address, fmt::join(qmd, ","));
         return true;
     }
@@ -545,6 +548,35 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
     }
     if (!launch_description.block_dim_x || !launch_description.block_dim_y || !launch_description.block_dim_z)
         return false;
+    // TEMP-FE-TRACE EDEN_NX2_CS_TRACE: log each compute program's first dispatch;
+    // EDEN_NX2_SKIP_CS=<hex address>,...: drop dispatches of those programs (to find a GPU hang).
+    {
+        const u64 program = (u64{qmd[49] & 0x1ffff} << 32) | qmd[48];
+        if (static const bool trace = std::getenv("EDEN_NX2_CS_TRACE") != nullptr; trace) {
+            static std::unordered_set<u64> seen;
+            if (seen.insert(program).second) {
+                std::fprintf(stderr, "nx2 compute first dispatch %#llx grid %ux%ux%u block %ux%ux%u\n",
+                             static_cast<unsigned long long>(program), qmd[12], qmd[13] & 0xffff,
+                             qmd[14] & 0xffff, qmd[18] >> 16, qmd[19] & 0xffff, qmd[19] >> 16);
+                std::fflush(stderr);
+            }
+        }
+        static const std::vector<u64> skip = [] {
+            std::vector<u64> list;
+            if (const char* text = std::getenv("EDEN_NX2_SKIP_CS")) {
+                for (char* end = nullptr; *text; text = *end ? end + 1 : end) {
+                    list.push_back(std::strtoull(text, &end, 16));
+                    if (end == text) break;
+                }
+            }
+            return list;
+        }();
+        // Program addresses shift between launches; their low 20 bits don't.
+        if (std::any_of(skip.begin(), skip.end(),
+                        [&](u64 entry) { return (entry & 0xfffff) == (program & 0xfffff); })) {
+            return true;
+        }
+    }
     try {
         rasterizer->DispatchCompute();
     } catch (const Shader::Exception& error) {

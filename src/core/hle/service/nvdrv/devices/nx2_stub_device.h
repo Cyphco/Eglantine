@@ -155,30 +155,47 @@ public:
         sparse_regions.clear();
     }
 
-    // Device (SMMU) address of a CPU range an address space mapped; used to present images.
+    // Device (SMMU) address of a CPU range an address space mapped; used to present images. Each
+    // address space maps a range at its own device address, so all of them are kept.
     void RecordDeviceRange(u64 cpu_address, u64 size, u64 device_address) {
         std::scoped_lock lk{device_mutex};
-        device_ranges[cpu_address] = {size, device_address};
+        auto& range = device_ranges[cpu_address];
+        if (range.first != size) {
+            range = {size, {}};
+        }
+        if (std::find(range.second.begin(), range.second.end(), device_address) == range.second.end()) {
+            range.second.push_back(device_address);
+        }
     }
 
     std::optional<u64> DeviceAddressOf(u64 cpu_address) {
+        const auto addresses = DeviceAddressesOf(cpu_address);
+        return addresses.empty() ? std::nullopt : std::optional<u64>{addresses.front()};
+    }
+
+    // Every device address the CPU address is mapped at, in the order address spaces mapped it.
+    std::vector<u64> DeviceAddressesOf(u64 cpu_address) {
         std::scoped_lock lk{device_mutex};
         auto it = device_ranges.upper_bound(cpu_address);
         if (it == device_ranges.begin()) {
-            return std::nullopt;
+            return {};
         }
         --it;
         const auto& [start, range] = *it;
         if (cpu_address - start >= range.first) {
-            return std::nullopt;
+            return {};
         }
-        return range.second + (cpu_address - start);
+        std::vector<u64> addresses;
+        for (const u64 device : range.second) {
+            addresses.push_back(device + (cpu_address - start));
+        }
+        return addresses;
     }
 
 private:
     // Separate lock: ranges are recorded from listeners that run under `mutex`.
     std::mutex device_mutex;
-    std::map<u64, std::pair<u64, u64>> device_ranges; // cpu start -> (size, device address)
+    std::map<u64, std::pair<u64, std::vector<u64>>> device_ranges; // cpu start -> (size, device addresses)
 
     struct Mapping {
         u64 gpu_address;

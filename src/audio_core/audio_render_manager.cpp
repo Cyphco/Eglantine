@@ -33,6 +33,8 @@ SystemManager& Manager::GetSystemManager() {
 Result Manager::GetWorkBufferSize(const AudioRendererParameterInternal& params,
                                   u64& out_count) const {
     if (!CheckValidRevision(params.revision)) {
+        LOG_ERROR(Service_Audio, "Unsupported renderer revision {:#x} (REV{}), newest is REV{}",
+                  params.revision, GetRevisionNum(params.revision), CurrentRevision);
         return Service::Audio::ResultInvalidRevision;
     }
 

@@ -135,6 +135,7 @@ public:
         RegisterHandlersTipc({
             {0, &INx2SyncptSession::Handshake, "Handshake"},
             {1, &INx2SyncptSession::GetCount, "GetCount (guessed)"},
+            {21, &INx2SyncptSession::SetEventCount, "SetEventCount"},
             {22, &INx2SyncptSession::GetSlotEvent, "GetSlotEvent (guessed)"},
             {103, &INx2SyncptSession::QueryCounter, "QueryCounter"},
             {201, &INx2SyncptSession::RequestSlotEvent, "RequestSlotEvent (guessed)"},
@@ -168,6 +169,13 @@ private:
     void GetCount(HLERequestContext& ctx) {
         LOG_WARNING(Service, "(STUBBED) nx2:syncpt TIPC 1, returning 32");
         TipcReplyWords(ctx, {32});
+    }
+
+    // 21(u32 count): newer SDKs set how many wait events they will use. Result only.
+    void SetEventCount(HLERequestContext& ctx) {
+        LOG_DEBUG(Service, "nx2:syncpt TIPC 21 count={}", ctx.CommandBuffer()[2]);
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
     }
 
     // From changes.patch: the counter is the bitwise NOT of the host1x syncpoint id.
@@ -304,6 +312,8 @@ public:
             {21, &INx2GpuSession::Start, "Start (guessed)"},
             {22, &INx2GpuSession::OpenSubSession, "OpenSubSession (guessed)"},
             {33, &INx2GpuSession::GetCount33, "Unknown33 (u32 count)"},
+            {41, &INx2GpuSession::CreateGraphicsDevice, "CreateGraphicsDevice"},
+            {42, &INx2GpuSession::DestroyGraphicsDevice, "DestroyGraphicsDevice"},
             {201, &INx2GpuSession::GetUserPartition, "GetUserPartition (newer SDKs)"},
             {202, &INx2GpuSession::GetGsvPartition, "GetGsvPartition (newer SDKs)"},
             {203, &INx2GpuSession::GetVaRange, "GetVaRange (guessed)"},
@@ -367,6 +377,23 @@ private:
     void GetCount33(HLERequestContext& ctx) {
         LOG_WARNING(Service, "(STUBBED) nx2:gpu TIPC 33 [2]={:#x}, returning 1", ctx.CommandBuffer()[2]);
         TipcReplyWords(ctx, {1});
+    }
+
+    // 41(u64 name "NvRm...", u64 flags, u64 debug label): newer SDKs create a graphics device and
+    // read its id after the result. Auto-stubbed, there was no id and title 5 dereferenced a null
+    // device in subsdk1 right after GetEngineInfo. Ids start at 1 (0 is "no device").
+    void CreateGraphicsDevice(HLERequestContext& ctx) {
+        const auto* w = ctx.CommandBuffer();
+        const u32 id = m_next_device_id++;
+        LOG_INFO(Service, "nx2:gpu TIPC 41 name={:#x} flags={:#x} -> device {}",
+                 u64{w[2]} | (u64{w[3]} << 32), u64{w[4]} | (u64{w[5]} << 32), id);
+        TipcReplyWords(ctx, {id});
+    }
+
+    void DestroyGraphicsDevice(HLERequestContext& ctx) {
+        LOG_DEBUG(Service, "nx2:gpu TIPC 42 device {}", ctx.CommandBuffer()[2]);
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
     }
 
     // Used by nn::gpu::sdk::CreateGpuAddressSpace: three u64s after the result, a kind (< 5, 0 =
@@ -786,6 +813,7 @@ private:
     std::array<Kernel::KEvent*, NumIds> m_events{};
     std::map<u32, GpuMemory> m_memory;
     u32 m_next_memory_handle{1};
+    u32 m_next_device_id{1};
 };
 
 // Native memory and images handed out by the Switch 2 graphics server (gsv 111/114/423/429/315),
@@ -952,6 +980,17 @@ public:
             // in an 18 minute session).
             {104, &INx2Vi2Session::SucceedQuietly, "Unknown104 (display \"default\")"},
             {105, &INx2Vi2Session::SucceedQuietly, "Unknown105 (display \"default\")"},
+            // Title 5 asks every frame (display "default"); the same reply as the auto stub.
+            {106, &INx2Vi2Session::SucceedQuietly, "GetBufferMaxResolution"},
+            // Newer SDKs (title 5) set up their display client with these; all reply with a
+            // result only, like the auto stub.
+            {51, &INx2Vi2Session::SucceedQuietly, "ConfigureRequestGroups"},
+            {101, &INx2Vi2Session::SucceedQuietly, "OpenDisplay"},
+            {111, &INx2Vi2Session::SucceedQuietly, "OpenEndpoint"},
+            {201, &INx2Vi2Session::SucceedQuietly, "RegisterClientState"},
+            {251, &INx2Vi2Session::SucceedQuietly, "BindClientDisplay"},
+            {269, &INx2Vi2Session::SucceedQuietly, "RegisterBufferMaxResolutionMonitor"},
+            {212, &INx2Vi2Session::GetClientAvailability, "GetClientAvailability"},
             {228, &INx2Vi2Session::CancelClientBuffer, "CancelClientBuffer"},
             {229, &INx2Vi2Session::PresentClientBuffer, "PresentClientBuffer"},
         });
@@ -1142,7 +1181,9 @@ private:
             address = memory->second.address;
             layout = Nx2CalculateImageLayout(image->second.preference.data());
         }
-        const auto device = Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(address);
+        const auto devices = Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressesOf(address);
+        const std::optional<u64> device =
+            devices.empty() ? std::nullopt : std::optional<u64>{devices.front()};
         if (!device) {
             LOG_WARNING(Service, "nx2:vi2 present: image {} at {:#x} has no device mapping",
                         image_id, address);
@@ -1194,6 +1235,9 @@ private:
             .blending = Tegra::BlendMode::Opaque,
             .native_tiling = true,
         }};
+        for (size_t i = 1; i < devices.size() && i <= layers[0].alternate_addresses.size(); ++i) {
+            layers[0].alternate_addresses[i - 1] = devices[i];
+        }
         std::vector<Nvidia::NvFence> fences;
         if (fence_id < 192) {
             fences.push_back({static_cast<s32>(fence_id), fence_value});
@@ -1201,6 +1245,7 @@ private:
         system.GPU().RequestComposite(std::move(layers), std::move(fences));
         CaptureFrame();
         DumpRanges();
+        DumpPresentedImage(address);
         system.SpeedLimiter().DoSpeedLimiting(system.CoreTiming().GetGlobalTimeUs());
         system.GetPerfStats().EndSystemFrame();
         system.GetPerfStats().BeginSystemFrame();
@@ -1280,11 +1325,58 @@ private:
         }
     }
 
+    // EDEN_NX2_DUMP_PRESENT=<present number>: dump the presented image's memory (block-linear, as
+    // the GPU wrote it) to nx2-present-<n>.bin in EDEN_NX2_FRAME_CAPTURE (or the working
+    // directory), to tell an empty frame from a compositing problem.
+    void DumpPresentedImage(u64 address) {
+        static const u64 wanted = [] {
+            const char* text = std::getenv("EDEN_NX2_DUMP_PRESENT");
+            return text ? std::strtoull(text, nullptr, 10) : 0ULL;
+        }();
+        if (wanted == 0 || m_presents != wanted) {
+            return;
+        }
+        u64 size{};
+        {
+            std::scoped_lock lk{m_objects->mutex};
+            for (const auto& [id, memory] : m_objects->memories) {
+                if (memory.address == address) size = memory.size;
+            }
+        }
+        const char* const directory = std::getenv("EDEN_NX2_FRAME_CAPTURE");
+        const std::string path =
+            fmt::format("{}/nx2-present-{}.bin", directory ? directory : ".", m_presents);
+        static_cast<void>(system.GPU().RunOnGpuThread([&system = system, address, size, path] {
+            std::vector<u8> bytes(size);
+            for (u64 current = address; current < address + size;) {
+                const u64 chunk = std::min((current | 0xfff) + 1, address + size) - current;
+                if (const auto device = Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(current)) {
+                    system.GPU().Renderer().ReadRasterizer()->FlushRegion(*device, chunk);
+                    system.Host1x().MemoryManager().ReadBlock(*device, bytes.data() + (current - address), chunk);
+                }
+                current += chunk;
+            }
+            if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
+                std::fwrite(bytes.data(), 1, bytes.size(), file);
+                std::fclose(file);
+            }
+            LOG_INFO(Service, "nx2: dumped presented image {:#x}+{:#x} to {}", address, size, path);
+        }));
+    }
+
     // 228(u64 token, u32 slot): return a buffer without presenting it.
     void CancelClientBuffer(HLERequestContext& ctx) {
         constexpr u64 AvailableSlots = 0x7fff;
         TipcReplyWords(ctx, {static_cast<u32>(AvailableSlots),
                              static_cast<u32>(AvailableSlots >> 32), 0, 0, 0, 0});
+    }
+
+    // 212(u64 client token): u64 mask of buffer slots the client may acquire, the same set
+    // PresentClientBuffer hands back.
+    void GetClientAvailability(HLERequestContext& ctx) {
+        constexpr u64 AvailableSlots = 0x7fff;
+        TipcReplyWords(ctx, {static_cast<u32>(AvailableSlots),
+                             static_cast<u32>(AvailableSlots >> 32)});
     }
 
     void ReturnOne(HLERequestContext& ctx) {
@@ -1860,6 +1952,20 @@ public:
             {4, &INx2GraphicsSystemSession::Stub, "Boot (Switch 2, guessed)"},
             {5, &INx2GraphicsSystemSession::Stub, "Unknown5"},
             {101, &INx2GraphicsSystemSession::Stub, "Unknown101"},
+            // Newer SDKs (title 5) bracket their setup with these context calls; all reply with
+            // a result only, like the auto stub.
+            {11, &INx2GraphicsSystemSession::Succeed, "BindProcess"},
+            {201, &INx2GraphicsSystemSession::Succeed, "InitializeSyncpointContext"},
+            {301, &INx2GraphicsSystemSession::Succeed, "InitializeDisplayContext"},
+            {401, &INx2GraphicsSystemSession::Succeed, "InitializeGpuContext"},
+            {402, &INx2GraphicsSystemSession::Succeed, "ActivateGpuContext"},
+            {434, &INx2GraphicsSystemSession::Succeed, "RegisterGpuAddressSpace"},
+            {1101, &INx2GraphicsSystemSession::Succeed, "InitializeFrameContext"},
+            {1102, &INx2GraphicsSystemSession::Succeed, "ActivateFrameContext"},
+            {1501, &INx2GraphicsSystemSession::Succeed, "InitializeImageContext"},
+            {1502, &INx2GraphicsSystemSession::Succeed, "InitializeImageFormats"},
+            {115, &INx2GraphicsSystemSession::ConfigureNativeMemory, "ConfigureNativeMemory"},
+            {126, &INx2GraphicsSystemSession::QueryMemoryMode, "QueryMemoryMode"},
             {202, &INx2GraphicsSystemSession::OpenSyncptSession, "OpenSyncptSession (guessed)"},
             {204, &INx2GraphicsSystemSession::AttachSyncptMemory, "AttachSyncptMemory (guessed)"},
             {305, &INx2GraphicsSystemSession::OpenViSession, "OpenViSession (guessed)"},
@@ -1925,6 +2031,25 @@ private:
                     ctx.GetCommand(), cmd_buf[2], cmd_buf[3], cmd_buf[4], cmd_buf[5]);
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
+    }
+
+    void Succeed(HLERequestContext& ctx) {
+        LOG_DEBUG(Service, "nx2:gsv TIPC {}", ctx.GetCommand());
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultSuccess);
+    }
+
+    // 115(u32 mode, u32): u64 optional memory mode flags after the result; 0 keeps the nvdrv
+    // path this session serves.
+    void ConfigureNativeMemory(HLERequestContext& ctx) {
+        LOG_DEBUG(Service, "nx2:gsv TIPC 115 mode={:#x}", ctx.CommandBuffer()[2]);
+        TipcReplyWords(ctx, {0, 0});
+    }
+
+    // 126(): u32 remote memory mode after the result; there is no remote memory (GetInfo 31/32
+    // report 0 too).
+    void QueryMemoryMode(HLERequestContext& ctx) {
+        TipcReplyWords(ctx, {0});
     }
 
     // nn::codec::video::detail::ipc::Initialize sends 901, 902, 1001, 1002. 902 and 1002 return

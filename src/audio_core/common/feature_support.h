@@ -16,7 +16,9 @@
 #include <ranges>
 
 namespace AudioCore {
-constexpr u32 CurrentRevision = 15;
+// REV16 is requested by Switch 2 programs (title 5); it is treated as REV15 (no REV16 features
+// are known yet).
+constexpr u32 CurrentRevision = 16;
 
 enum class SupportTags {
     CommandProcessingTimeEstimatorVersion4,

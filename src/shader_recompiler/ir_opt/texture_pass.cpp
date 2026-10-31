@@ -716,6 +716,54 @@ void PatchTexelFetch(IR::Block& block, IR::Inst& inst, TexturePixelFormat pixel_
                               ir.FPMul(ir.ConvertSToF(32, 32, ir.BitCast<IR::U32>(w)), max_value));
     inst.ReplaceUsesWith(converted);
 }
+
+// EDEN_NX2_BINDLESS_FALLBACK=1: a bindless handle that comes from memory at run time (Switch 2
+// materials read 64-bit handles from a buffer) cannot be tracked to a constant buffer, which
+// rejects the whole program. With the fallback, such an access returns neutral grey (a size
+// query returns 1, a write is dropped) so the rest of the program runs. Accesses with a sparse
+// residency result still reject the program.
+bool ReplaceUntrackedBindless(IR::Block& block, IR::Inst& inst) {
+    static const bool enabled = std::getenv("EDEN_NX2_BINDLESS_FALLBACK") != nullptr;
+    if (!enabled || inst.GetAssociatedPseudoOperation(IR::Opcode::GetSparseFromOp) != nullptr) {
+        return false;
+    }
+    IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
+    switch (inst.GetOpcode()) {
+    case IR::Opcode::BindlessImageSampleImplicitLod:
+    case IR::Opcode::BindlessImageSampleExplicitLod:
+    case IR::Opcode::BindlessImageGather:
+    case IR::Opcode::BindlessImageFetch:
+    case IR::Opcode::BindlessImageGradient: {
+        const IR::F32 grey{ir.Imm32(0.5f)};
+        inst.ReplaceUsesWith(ir.CompositeConstruct(grey, grey, grey, ir.Imm32(1.0f)));
+        return true;
+    }
+    case IR::Opcode::BindlessImageSampleDrefImplicitLod:
+    case IR::Opcode::BindlessImageSampleDrefExplicitLod:
+        inst.ReplaceUsesWith(ir.Imm32(1.0f));
+        return true;
+    case IR::Opcode::BindlessImageGatherDref: {
+        const IR::F32 one{ir.Imm32(1.0f)};
+        inst.ReplaceUsesWith(ir.CompositeConstruct(one, one, one, one));
+        return true;
+    }
+    case IR::Opcode::BindlessImageQueryDimensions: {
+        const IR::U32 one{ir.Imm32(1U)};
+        inst.ReplaceUsesWith(ir.CompositeConstruct(one, one, one, one));
+        return true;
+    }
+    case IR::Opcode::BindlessImageQueryLod: {
+        const IR::F32 zero{ir.Imm32(0.0f)};
+        inst.ReplaceUsesWith(ir.CompositeConstruct(zero, zero, zero, zero));
+        return true;
+    }
+    case IR::Opcode::BindlessImageWrite:
+        inst.Invalidate();
+        return true;
+    default:
+        return false;
+    }
+}
 } // Anonymous namespace
 
 void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo& host_info) {
@@ -728,6 +776,10 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
         env.track_cache.clear();
         for (IR::Inst& inst : block->Instructions()) {
             if (!IsTextureInstruction(inst)) {
+                continue;
+            }
+            if (IsBindless(inst) && !TrackCached(inst.Arg(0), env, host_info, block) &&
+                ReplaceUntrackedBindless(*block, inst)) {
                 continue;
             }
             to_replace.push_back(MakeInst(env, block, inst, host_info));

@@ -114,6 +114,9 @@ NvResult nvhost_ctrl_gpu::Ioctl3(DeviceFD fd, Ioctl command, std::span<const u8>
                                    inline_output);
         case 0x13:
             LOG_DEBUG(Service_NVDRV, "(STUBBED) called.");
+            if (nx2_caller) {
+                return Nx2GetVsmsMapping(input, output, inline_output);
+            }
 
             // TODO (jarrodnorwell)
 
@@ -177,6 +180,23 @@ NvResult nvhost_ctrl_gpu::Nx2GetEngineInfo(std::span<const u8> input, std::span<
     return NvResult::Success;
 }
 
+// nvgpu VSMS_MAPPING: args {u64 buf_addr}, with an inline output buffer of {u8 gpc_index,
+// u8 tpc_index} per SM. The Switch 2 NvRm (title 5) asks for 8 bytes after GET_TPC_MASKS on
+// every device probe; it used to get NotImplemented. Report every SM in GPC 0, two SMs per TPC
+// (Ampere).
+NvResult nvhost_ctrl_gpu::Nx2GetVsmsMapping(std::span<const u8> input, std::span<u8> output,
+                                            std::span<u8> inline_output) {
+    LOG_WARNING(Service_NVDRV, "(STUBBED) Switch 2 VSMS_MAPPING inline_out={:#x}",
+                inline_output.size());
+    for (size_t sm = 0; sm + 1 < inline_output.size(); sm += 2) {
+        inline_output[sm] = 0;
+        inline_output[sm + 1] = static_cast<u8>(sm / 4);
+    }
+    std::fill(output.begin(), output.end(), u8{0});
+    std::copy_n(input.begin(), std::min(input.size(), output.size()), output.begin());
+    return NvResult::Success;
+}
+
 void nvhost_ctrl_gpu::OnOpen(NvCore::SessionId session_id, DeviceFD fd) {}
 void nvhost_ctrl_gpu::OnClose(DeviceFD fd) {}
 
@@ -207,6 +227,11 @@ void ApplyNx2Characteristics(GC& gc) {
     // Without the flag NvRm fails that call and the texture stays at GPU address 0 (title 1's
     // movie and the passes rendered into compressible pools never showed).
     gc.flags |= 1ULL << 34;
+    // NVGPU_GPU_FLAGS_SUPPORT_2D/3D/COMPUTE/I2M/ZBC (bits 40..44). Newer NvRm (title 5) only adds
+    // the 2D, 3D and compute classes to a device's class list when these are set; without them
+    // its GPU object had no 3D or compute class, the CUDA-style driver in subsdk1 rejected the
+    // device as NO_DEVICE and the program aborted while tearing it down.
+    gc.flags |= 0x1FULL << 40;
 
     // The Switch 2 layout keeps nine s16 interface versions at 0x70..0x80 (like nvgpu's
     // *_ioctl_nr_last); its NvRm requires e.g. [0x78] >= 6 and enables features above 0xa, 0x1f

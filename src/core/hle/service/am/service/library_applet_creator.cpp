@@ -24,6 +24,17 @@ namespace Service::AM {
 
 namespace {
 
+// Switch 2 titles pass applet IDs with bits set above the Switch 1 value (Fire Emblem's name entry
+// asks for 0x...11, the software keyboard); the low byte is the Switch 1 ID.
+AppletId NormalizeAppletId(AppletId applet_id) {
+    const u32 raw = static_cast<u32>(applet_id);
+    if (raw > 0xff) {
+        LOG_WARNING(Service_AM, "Switch 2 applet ID {:#x}, using {:#x}", raw, raw & 0xff);
+        return static_cast<AppletId>(raw & 0xff);
+    }
+    return applet_id;
+}
+
 bool ShouldCreateGuestApplet(AppletId applet_id) {
 #define X(Name, name)                                                                              \
     if (applet_id == AppletId::Name &&                                                             \
@@ -181,6 +192,7 @@ ILibraryAppletCreator::~ILibraryAppletCreator() = default;
 Result ILibraryAppletCreator::CreateLibraryApplet(
     Out<SharedPointer<ILibraryAppletAccessor>> out_library_applet_accessor, AppletId applet_id,
     LibraryAppletMode library_applet_mode) {
+    applet_id = NormalizeAppletId(applet_id);
     LOG_DEBUG(Service_AM, "called with applet_id={} applet_mode={}", applet_id,
               library_applet_mode);
 
@@ -207,6 +219,7 @@ Result ILibraryAppletCreator::CreateLibraryApplet(
 Result ILibraryAppletCreator::CreateLibraryAppletEx(
     Out<SharedPointer<ILibraryAppletAccessor>> out_library_applet_accessor, AppletId applet_id,
     LibraryAppletMode library_applet_mode, u64 thread_id) {
+    applet_id = NormalizeAppletId(applet_id);
     LOG_DEBUG(Service_AM, "called with applet_id={} applet_mode={} thread_id={}", applet_id,
               library_applet_mode, thread_id);
 

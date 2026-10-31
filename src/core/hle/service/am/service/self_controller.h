@@ -70,6 +70,7 @@ private:
     Result SetRecordVolumeMuted(bool muted);
     Result Unknown230(u32 in_val, Out<u16> out_val);
     Result Unknown240(u32 in_val);
+    Result SetRtcScreenSharingAudioEnabled(u32 enabled);
 
     Kernel::KProcess* const m_process;
     const std::shared_ptr<Applet> m_applet;
