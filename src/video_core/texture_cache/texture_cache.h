@@ -781,28 +781,6 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
 }
 
 template <class P>
-void TextureCache<P>::DebugDumpImages(DAddr cpu_addr, const std::string& prefix) {
-    boost::container::small_vector<ImageId, 4> images;
-    ForEachImageInRegion(cpu_addr, 1, [&](ImageId image_id, ImageBase& image) {
-        if (image.cpu_addr == cpu_addr) images.push_back(image_id);
-    });
-    for (const ImageId image_id : images) {
-        Image& image = slot_images[image_id];
-        auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
-        const auto copies = FullDownloadCopies(image.info);
-        image.DownloadMemory(map, copies);
-        runtime.Finish();
-        const std::string path = fmt::format("{}-{}x{}-f{}.bin", prefix, image.info.size.width,
-                                             image.info.size.height, static_cast<u32>(image.info.format));
-        if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
-            std::fwrite(map.mapped_span.data(), 1, image.unswizzled_size_bytes, file);
-            std::fclose(file);
-        }
-        LOG_INFO(HW_GPU, "debug dump {:#x} -> {}", cpu_addr, path);
-    }
-}
-
-template <class P>
 std::optional<VideoCore::RasterizerDownloadArea> TextureCache<P>::GetFlushArea(DAddr cpu_addr,
                                                                                u64 size) {
     std::optional<VideoCore::RasterizerDownloadArea> area{};

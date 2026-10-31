@@ -318,8 +318,7 @@ Tegra::Texture::TICEntry GenericEnvironment::ReadTextureInfo(GPUVAddr tic_addr, 
     if (handle.first > tic_limit) {
         // Past the descriptor table: draws bind the null 2D view for it (TextureCache::
         // VisitImageView), so describe a plain 2D RGBA8 texture rather than whatever memory
-        // follows the table. A shader built for a garbage type (a buffer or cube texture) next to
-        // the bound 2D null view faulted the host GPU in title 5's battlefield.
+        // follows the table (garbage there could declare a buffer or cube texture).
         static u32 reported{};
         if (reported++ < 8) {
             LOG_WARNING(Shader, "Texture handle {:#x} past the descriptor table (limit {:#x})", raw, tic_limit);
@@ -460,24 +459,6 @@ void GenericEnvironment::InitializeNativeCode(u32 source_header_size) {
     if (lowered.required_texture_buffer != ~0U) {
         // Native TEX carries its cbuf index explicitly; TEXS obtains it from the environment.
         texture_bound = lowered.required_texture_buffer;
-    }
-    // TEMP-FE-TRACE EDEN_NX2_TRIVIAL_HASH=<hex>,...: replace programs whose first 512 bytes (header
-    // included; the hash EDEN_NX2_PS_TRACE prints) match with a bare EXIT, to tell a faulting
-    // vertex shader from its pixel shader.
-    if (const char* text = std::getenv("EDEN_NX2_TRIVIAL_HASH")) {
-        std::array<u8, 512> bytes{};
-        gpu_memory->ReadBlockUnsafe(program_base + start_address, bytes.data(), bytes.size());
-        u64 hash = 0xcbf29ce484222325ULL;
-        for (const u8 byte : bytes) hash = (hash ^ byte) * 0x100000001b3ULL;
-        for (char* end = nullptr; *text; text = *end ? end + 1 : end) {
-            const u64 wanted = std::strtoull(text, &end, 16);
-            if (end == text) break;
-            if (wanted == hash) {
-                LOG_WARNING(Shader, "Replacing native program {:016x} at {:#x} with EXIT", hash, program_base);
-                lowered.instructions = {0xe30000000007000fULL};
-                break;
-            }
-        }
     }
     // Rebased native stack accesses need this much local memory (read at translation time).
     local_memory_size = (std::max)(local_memory_size, lowered.local_memory_window);

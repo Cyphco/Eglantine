@@ -1245,7 +1245,6 @@ private:
         system.GPU().RequestComposite(std::move(layers), std::move(fences));
         CaptureFrame();
         DumpRanges();
-        DumpPresentedImage(address);
         system.SpeedLimiter().DoSpeedLimiting(system.CoreTiming().GetGlobalTimeUs());
         system.GetPerfStats().EndSystemFrame();
         system.GetPerfStats().BeginSystemFrame();
@@ -1323,45 +1322,6 @@ private:
                 LOG_INFO(Service, "nx2: dumped {:#x} bytes at {:#x} to {}", size, address, path);
             }));
         }
-    }
-
-    // EDEN_NX2_DUMP_PRESENT=<present number>: dump the presented image's memory (block-linear, as
-    // the GPU wrote it) to nx2-present-<n>.bin in EDEN_NX2_FRAME_CAPTURE (or the working
-    // directory), to tell an empty frame from a compositing problem.
-    void DumpPresentedImage(u64 address) {
-        static const u64 wanted = [] {
-            const char* text = std::getenv("EDEN_NX2_DUMP_PRESENT");
-            return text ? std::strtoull(text, nullptr, 10) : 0ULL;
-        }();
-        if (wanted == 0 || m_presents != wanted) {
-            return;
-        }
-        u64 size{};
-        {
-            std::scoped_lock lk{m_objects->mutex};
-            for (const auto& [id, memory] : m_objects->memories) {
-                if (memory.address == address) size = memory.size;
-            }
-        }
-        const char* const directory = std::getenv("EDEN_NX2_FRAME_CAPTURE");
-        const std::string path =
-            fmt::format("{}/nx2-present-{}.bin", directory ? directory : ".", m_presents);
-        static_cast<void>(system.GPU().RunOnGpuThread([&system = system, address, size, path] {
-            std::vector<u8> bytes(size);
-            for (u64 current = address; current < address + size;) {
-                const u64 chunk = std::min((current | 0xfff) + 1, address + size) - current;
-                if (const auto device = Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(current)) {
-                    system.GPU().Renderer().ReadRasterizer()->FlushRegion(*device, chunk);
-                    system.Host1x().MemoryManager().ReadBlock(*device, bytes.data() + (current - address), chunk);
-                }
-                current += chunk;
-            }
-            if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
-                std::fwrite(bytes.data(), 1, bytes.size(), file);
-                std::fclose(file);
-            }
-            LOG_INFO(Service, "nx2: dumped presented image {:#x}+{:#x} to {}", address, size, path);
-        }));
     }
 
     // 228(u64 token, u32 slot): return a buffer without presenting it.

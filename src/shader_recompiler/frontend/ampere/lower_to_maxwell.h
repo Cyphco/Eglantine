@@ -1779,22 +1779,6 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
                 // LDC the handle and fetch with Maxwell TLD.B (handle first in the meta registers)
                 // into scratch, then copy the components out.
                 if (array) return fail(index, "native texture descriptor buffer conflict");
-                // TEMP-FE-TRACE: EDEN_NX2_GREY_BANKS also covers these fetches.
-                if (const char* text = std::getenv("EDEN_NX2_GREY_BANKS")) {
-                    bool listed = false;
-                    for (char* end = nullptr; *text && !listed; text = *end ? end + 1 : end) {
-                        listed = std::strtoul(text, &end, 10) == binding;
-                        if (end == text) break;
-                    }
-                    if (listed) {
-                        const u32 components = static_cast<u32>(std::popcount(mask));
-                        for (u32 i = 0; i < components; ++i) {
-                            const u32 target = !split || i < 2 ? static_cast<u32>(dest) + i : second_dest + (i - 2);
-                            if (target < 255) mov_imm(target, 0x3f000000U);
-                        }
-                        break;
-                    }
-                }
                 const auto copy = [&](u32 target, u32 source) {
                     emit(0x5c98000000000000ULL | predicate | target | (u64{15} << 39) | (u64{source} << 20));
                 };
@@ -1892,24 +1876,6 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
         case 0xf60: { // TEX with the handle in a uniform register (bits 40-47, title 5's cube captures)
             const u32 mask = insn.Bits(72, 4);
             const u32 second_dest = insn.Bits(64, 8);
-            // TEMP-FE-TRACE EDEN_NX2_GREY_TEX_OFFSETS=<hex byte offset>,...: TEX at those native
-            // offsets returns grey (to find the fetch that faults the GPU).
-            if (const char* text = std::getenv("EDEN_NX2_GREY_TEX_OFFSETS")) {
-                bool listed = false;
-                for (char* end = nullptr; *text && !listed; text = *end ? end + 1 : end) {
-                    listed = std::strtoul(text, &end, 16) == index * 16;
-                    if (end == text) break;
-                }
-                if (listed) {
-                    const u32 components = static_cast<u32>(std::popcount(mask));
-                    for (u32 i = 0; i < components; ++i) {
-                        const u32 target = second_dest == 255 || i < 2 ? static_cast<u32>(dest) + i
-                                                                       : second_dest + (i - 2);
-                        if (dest != 255 && target < 255) mov_imm(target, 0x3f000000U);
-                    }
-                    break;
-                }
-            }
             constexpr std::array<u32, 8> rg_masks{1, 2, 4, 8, 3, 9, 10, 12};
             constexpr std::array<u32, 5> rgba_masks{7, 11, 13, 14, 15};
             u32 swizzle = ~0U;
@@ -1977,21 +1943,6 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
                 const bool bindless = register_handle || uniform_handle || (result.required_texture_buffer != ~0U &&
                                                           result.required_texture_buffer != binding);
                 if (!bindless) result.required_texture_buffer = binding;
-                // TEMP-FE-TRACE EDEN_NX2_GREY_BANKS=<bank>,...: samples through descriptors in those
-                // other banks return grey instead (to find a descriptor that faults the GPU).
-                static const u32 grey_banks = [] {
-                    u32 mask = 0;
-                    if (const char* text = std::getenv("EDEN_NX2_GREY_BANKS")) {
-                        for (char* end = nullptr; *text; text = *end ? end + 1 : end) {
-                            const unsigned long bank = std::strtoul(text, &end, 10);
-                            if (end == text) break;
-                            if (bank < 32) mask |= 1U << bank;
-                        }
-                    }
-                    return mask;
-                }();
-                const bool grey = bindless && !register_handle && !uniform_handle &&
-                                  ((grey_banks >> binding) & 1) != 0;
                 const auto copy = [&](u32 target, u32 source) {
                     emit(0x5c98000000000000ULL | predicate | target | (u64{15} << 39) | (u64{source} << 20));
                 };
@@ -2015,9 +1966,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
                                    (u64{maxwell_type[dimension]} << 28) | (u64{mask} << 31) |
                                    (u64{insn.Bits(90, 1)} << 49) | (u64{depth_compare} << 50) |
                                    (u64{7} << 51);
-                if (grey) {
-                    for (u32 i = 0; i < 4; ++i) mov_imm(250 + i, 0x3f000000U);
-                } else if (bindless) { // TEX.B: AOFFI bit 36, LOD 37-39, handle first in the meta registers
+                if (bindless) { // TEX.B: AOFFI bit 36, LOD 37-39, handle first in the meta registers
                     emit(0xde80000000000000ULL | fields | (u64{offsets} << 36) | (u64{lod} << 37));
                 } else {
                     emit(0xc000000000000000ULL | fields | (u64{insn.Bits(40, 14)} << 36) |

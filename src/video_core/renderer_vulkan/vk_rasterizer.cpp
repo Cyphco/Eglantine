@@ -10,10 +10,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <tuple>
-#include <map>
-#include <set>
+#include <unordered_map>
 #include <vector>
-#include <filesystem>
+#include <set>
 #include <fstream>
 #include <mutex>
 
@@ -384,10 +383,6 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
              (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1],
              (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1],
              regs.rasterize_enable);
-    // TEMP-FE-TRACE: the device address the window target resolves to (the presenter looks it up
-    // by the device address of the CPU-side window image).
-    LOG_INFO(HW_GPU, "nx2 window rt0 device address {:#x}",
-             memory.GpuToCpuAddress(regs.rt[0].Address()).value_or(0));
     if (kind[0] != 'd') {
         return;
     }
@@ -529,209 +524,64 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
         const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
         if (std::find(skip_list.begin(), skip_list.end(), vs) != skip_list.end()) return;
     }
-    // TEMP-FE-TRACE EDEN_NX2_PS_TRACE: each pixel shader's first draw, to stderr (survives a
-    // GPU crash that the asynchronous log loses).
-    // EDEN_NX2_SKIP_RT=<hex address>: drop draws into that colour target; EDEN_NX2_SKIP_PS_INDEX=
-    // <n>,...: drop draws of the n-th pixel shader in first-use order (addresses shift between
-    // launches, the order doesn't).
-    {
-        static const bool trace = std::getenv("EDEN_NX2_PS_TRACE") != nullptr;
-        static const u64 skip_rt = [] {
-            const char* text = std::getenv("EDEN_NX2_SKIP_RT");
-            return text ? std::strtoull(text, nullptr, 16) : 0ULL;
-        }();
-        static const std::vector<u32> skip_index = [] {
-            std::vector<u32> list;
-            if (const char* text = std::getenv("EDEN_NX2_SKIP_PS_INDEX")) {
-                for (char* end = nullptr; *text; text = *end ? end + 1 : end) {
-                    list.push_back(static_cast<u32>(std::strtoul(text, &end, 10)));
-                    if (end == text) break;
-                }
+    // EDEN_NX2_SKIP_PS_HASH=<hex>[,<hex>...]: drop draws whose pixel shader's first 512 bytes
+    // (header included) hash to one of these FNV-1a values. Shader addresses change between
+    // launches; the code doesn't. Fire Emblem has one battlefield draw that resets the host GPU.
+    static const std::vector<u64> skip_ps_hashes = [] {
+        std::vector<u64> list;
+        if (const char* text = std::getenv("EDEN_NX2_SKIP_PS_HASH")) {
+            for (char* end = nullptr; *text; text = *end ? end + 1 : end) {
+                list.push_back(std::strtoull(text, &end, 16));
+                if (end == text) break;
             }
-            return list;
-        }();
-        // EDEN_NX2_SKIP_PS_HASH=<hex>,...: drop draws of pixel shaders whose first 512 code bytes
-        // hash (FNV-1a, printed by the trace) to these values; stable across launches.
-        static const std::vector<u64> skip_hash = [] {
-            std::vector<u64> list;
-            if (const char* text = std::getenv("EDEN_NX2_SKIP_PS_HASH")) {
-                for (char* end = nullptr; *text; text = *end ? end + 1 : end) {
-                    list.push_back(std::strtoull(text, &end, 16));
-                    if (end == text) break;
-                }
-            }
-            return list;
-        }();
-        struct PixelShaderInfo { u32 index; u64 hash; };
-        static std::map<u64, PixelShaderInfo> ps_info;
-        if (!trace && skip_rt == 0 && skip_index.empty() && skip_hash.empty()) goto skip_checks_done;
-        {
+        }
+        return list;
+    }();
+    if (!skip_ps_hashes.empty()) {
+        static std::unordered_map<u64, u64> ps_hashes; // pixel shader address -> code hash
         const auto& regs = maxwell3d->regs;
         const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
-        const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
-        auto it = ps_info.find(ps);
-        if (it == ps_info.end()) {
+        auto it = ps_hashes.find(ps);
+        if (it == ps_hashes.end()) {
             std::array<u8, 512> code{};
             gpu_memory->ReadBlockUnsafe(ps, code.data(), code.size());
             u64 hash = 0xcbf29ce484222325ULL;
             for (const u8 byte : code) hash = (hash ^ byte) * 0x100000001b3ULL;
-            it = ps_info.emplace(ps, PixelShaderInfo{static_cast<u32>(ps_info.size()), hash}).first;
-            if (trace) {
-                std::fprintf(stderr, "nx2 pixel shader first draw #%u hash %016llx ps %#llx vs %#llx rt %#llx %ux%u\n",
-                             it->second.index, static_cast<unsigned long long>(hash),
-                             static_cast<unsigned long long>(ps), static_cast<unsigned long long>(vs),
-                             static_cast<unsigned long long>(regs.rt[0].Address()), regs.rt[0].width,
-                             regs.rt[0].height);
-                std::fflush(stderr);
-            }
+            it = ps_hashes.emplace(ps, hash).first;
         }
-        // TEMP-FE-TRACE EDEN_NX2_TRACE_PS_HASH=<hex>: the first 3 draws of that pixel shader log
-        // their bank 2 texture handles and the descriptors they name.
-        static const u64 trace_hash = [] {
-            const char* text = std::getenv("EDEN_NX2_TRACE_PS_HASH");
-            return text ? std::strtoull(text, nullptr, 16) : 0ULL;
-        }();
-        if (trace_hash != 0 && it->second.hash == trace_hash) {
-            static u32 traced{};
-            const auto& cb2 = maxwell3d->state.shader_stages[4].const_buffers[2];
-            if (traced++ < 3 && cb2.enabled) {
-                std::fprintf(stderr, "nx2 traced draw: c[2] %#llx size %#x, tic limit %#x tsc limit %#x linked %d\n",
-                             static_cast<unsigned long long>(cb2.address), cb2.size, regs.tex_header.limit,
-                             regs.tex_sampler.limit, regs.sampler_binding == Tegra::Engines::Maxwell3D::Regs::SamplerBinding::ViaHeaderBinding ? 1 : 0);
-                for (u32 offset = 0x20; offset <= 0x44; offset += 4) {
-                    const u32 handle = gpu_memory->Read<u32>(cb2.address + offset);
-                    Tegra::Texture::TICEntry tic{};
-                    gpu_memory->ReadBlockUnsafe(regs.tex_header.Address() + u64{handle & 0xfffff} * sizeof(tic),
-                                                &tic, sizeof(tic));
-                    std::fprintf(stderr, "  c[2]+%#x = %08x: tic addr %#llx %ux%u fmt %#x type %u words %016llx %016llx\n",
-                                 offset, handle, static_cast<unsigned long long>(tic.Address()), tic.Width(),
-                                 tic.Height(), static_cast<u32>(tic.format.Value()),
-                                 static_cast<u32>(tic.texture_type.Value()),
-                                 static_cast<unsigned long long>(tic.raw[0]),
-                                 static_cast<unsigned long long>(tic.raw[2]));
-                }
-                std::fflush(stderr);
-            }
-        }
-        const bool skip_by_hash =
-            std::find(skip_hash.begin(), skip_hash.end(), it->second.hash) != skip_hash.end();
-        if (skip_by_hash) {
-            // A skipped shader is never translated, so the shader dump misses it: save its raw
-            // code (from the pipeline address, header included) once.
-            static std::set<u64> saved;
-            const char* dir = std::getenv("EDEN_NX2_SHADER_DUMP");
-            if (dir != nullptr && saved.insert(it->second.hash).second) {
-                std::vector<u8> code(0x10000);
-                gpu_memory->ReadBlockUnsafe(ps, code.data(), code.size());
-                const std::string path = fmt::format("{}/skipped-{:016x}-{:x}.bin", dir, it->second.hash, ps);
-                if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
-                    std::fwrite(code.data(), 1, code.size(), file);
-                    std::fclose(file);
-                }
-                gpu_memory->ReadBlockUnsafe(vs, code.data(), code.size());
-                const std::string vs_path = fmt::format("{}/skipped-{:016x}-vs-{:x}.bin", dir, it->second.hash, vs);
-                if (std::FILE* file = std::fopen(vs_path.c_str(), "wb")) {
-                    std::fwrite(code.data(), 1, code.size(), file);
-                    std::fclose(file);
-                }
-                const auto& draw = maxwell3d->draw_manager.draw_state;
-                u64 vs_hash = 0xcbf29ce484222325ULL;
-                for (size_t i = 0; i < 512; ++i) vs_hash = (vs_hash ^ code[i]) * 0x100000001b3ULL;
-                std::fprintf(stderr, "nx2 skipped draw: indexed %d vertices %u first %u indices %u instances %u topology %u vs hash %016llx\n",
-                             is_indexed ? 1 : 0, draw.vertex_buffer.count, draw.vertex_buffer.first,
-                             draw.index_buffer.count, instance_count, static_cast<u32>(draw.topology),
-                             static_cast<unsigned long long>(vs_hash));
-                std::fflush(stderr);
-            }
-        }
-        if ((skip_rt != 0 && regs.rt[0].Address() == skip_rt) ||
-            std::find(skip_index.begin(), skip_index.end(), it->second.index) != skip_index.end() ||
-            skip_by_hash) {
+        if (std::find(skip_ps_hashes.begin(), skip_ps_hashes.end(), it->second) != skip_ps_hashes.end()) {
             return;
-        }
-        }
-    }
-skip_checks_done:
-    // TEMP-FE-TRACE EDEN_NX2_CONST_TRACE: every 600th draw to the HDR window, its pixel-stage
-    // c[3] (paper white and the neighbouring HDR constants), before any patching.
-    if (static const bool trace = std::getenv("EDEN_NX2_CONST_TRACE") != nullptr; trace) {
-        const auto& rt0 = maxwell3d->regs.rt[0];
-        const auto& cb3 = maxwell3d->state.shader_stages[4].const_buffers[3];
-        static u32 window_draws{};
-        if (static_cast<u32>(rt0.format) == 0xd1 && rt0.width == 3840 && cb3.enabled &&
-            window_draws++ % 600 == 0) {
-            std::array<f32, 12> values{};
-            gpu_memory->ReadBlockUnsafe(cb3.address, values.data(), sizeof(values));
-            LOG_INFO(HW_GPU, "nx2 window constants (draw {}): {}", window_draws, fmt::join(values, " "));
         }
     }
     // EDEN_NX2_NAN_CONSTANT_FIX: Fire Emblem's post-process constants (exposure, tonemap white
-    // point, UI fade) arrive as NaN while the compute pass that derives them doesn't run, which
-    // blanks the whole frame. Replace NaN words in the pixel stage's user constants with 1.0.
-    // TEMP-FE-TRACE EDEN_NX2_NAN_SCAN: report CPU-default NaNs in any pixel-stage constant buffer.
-    if (static const bool scan = std::getenv("EDEN_NX2_NAN_SCAN") != nullptr; scan) {
-        static std::set<std::pair<u64, u32>> reported;
-        const auto& regs = maxwell3d->regs;
-        const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
-        for (u32 bank = 0; bank < Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers; ++bank) {
-            const auto& cb = maxwell3d->state.shader_stages[4].const_buffers[bank];
-            if (!cb.enabled || cb.size == 0 || reported.size() >= 200 || reported.contains({ps, bank})) continue;
-            std::vector<u32> data(std::min<u32>(cb.size, 0x2000) / 4);
-            gpu_memory->ReadBlockUnsafe(cb.address, data.data(), data.size() * 4);
-            std::string offsets;
-            for (size_t i = 0; i < data.size(); ++i) {
-                if (data[i] == 0x7fc00000U && offsets.size() < 200) offsets += fmt::format(" {:#x}", i * 4);
-            }
-            if (!offsets.empty()) {
-                reported.insert({ps, bank});
-                LOG_INFO(HW_GPU, "nx2 NaN scan ps {:#x} rt {:#x} {}x{} c[{}]:{}", ps, regs.rt[0].Address(),
-                         regs.rt[0].width, regs.rt[0].height, bank, offsets);
-            }
-        }
-    }
+    // point, bloom threshold, UI fade) arrive as the CPU's default NaN, and the HDR window pass's
+    // paper white (c[3][0x2c]) as 0: both blank the frame. Patch them in the pixel stage's user
+    // constants: bloom's soft-knee block to an unreachable threshold (bloom off), other NaNs to
+    // 1.0, paper white to 100 nits.
     if (static const bool fix_nan = std::getenv("EDEN_NX2_NAN_CONSTANT_FIX") != nullptr; fix_nan) {
         const auto& cb3 = maxwell3d->state.shader_stages[4].const_buffers[3];
         if (cb3.enabled && cb3.size != 0 && cb3.size <= 0x1000) {
             std::array<u32, 0x400> words{};
             const size_t count = cb3.size / sizeof(u32);
             gpu_memory->ReadBlockUnsafe(cb3.address, words.data(), count * sizeof(u32));
+            // Only the CPU's default NaN: other all-ones patterns are integer constants.
+            constexpr u32 default_nan = 0x7fc00000U;
             bool patched = false;
-            const auto is_nan = [](u32 word) { return word == 0x7fc00000U; };
-            // The bloom passes' soft-knee threshold (c[3][0..3]: threshold, threshold - knee,
-            // 2 * knee, 0.25 / knee) is scaled by the missing exposure; 1.0 there blooms every
-            // bright red pixel. Use an unreachable threshold, which turns bloom off.
-            if (count >= 4 && is_nan(words[0]) && is_nan(words[1]) && is_nan(words[2]) &&
-                is_nan(words[3])) {
+            if (count >= 4 && words[0] == default_nan && words[1] == default_nan &&
+                words[2] == default_nan && words[3] == default_nan) {
                 words[0] = words[1] = 0x461c4000U; // 10000.0
                 words[2] = words[3] = 0;
                 patched = true;
             }
-            std::string patched_words; // TEMP-FE-TRACE
             for (size_t i = 0; i < count; ++i) {
-                // Only the CPU's default NaN: other all-ones patterns are integer constants
-                // (-1 texel offsets in the 256x256 passes).
-                if (words[i] == 0x7fc00000U) {
-                    patched_words += fmt::format(" {:#x}", i * 4);
+                if (words[i] == default_nan) {
                     words[i] = 0x3f800000U;
                     patched = true;
                 }
             }
-            // TEMP-FE-TRACE: which shaders' constants get patched, once per shader.
-            if (!patched_words.empty()) {
-                static std::set<u64> reported;
-                const auto& regs = maxwell3d->regs;
-                const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
-                if (reported.size() < 100 && reported.insert(ps).second) {
-                    LOG_INFO(HW_GPU, "nx2 NaN constants patched for ps {:#x} rt {:#x} {}x{}: c[3] bytes{}", ps,
-                             regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height, patched_words);
-                }
-            }
-            // The HDR10 window pass scales by c[3][0x2c] (paper white in nits) / 10000; it arrives
-            // as 0, which encodes every pixel as black. Use 100 nits.
             const auto& rt0 = maxwell3d->regs.rt[0];
-            if (static_cast<u32>(rt0.format) == 0xd1 && rt0.width == 3840 && count > 11 &&
-                words[11] == 0) {
-                words[11] = 0x42c80000U;
+            if (static_cast<u32>(rt0.format) == 0xd1 && rt0.width == 3840 && count > 11 && words[11] == 0) {
+                words[11] = 0x42c80000U; // 100.0
                 patched = true;
             }
             if (patched) {
@@ -747,49 +597,10 @@ skip_checks_done:
         const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
         const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
         const auto key = std::make_tuple(rt.Address(), rt.width, static_cast<u32>(rt.format), vs, ps);
-        if (rt.width >= 256 && seen.size() < 900 && seen.insert(key).second) {
+        if (rt.width >= 640 && seen.size() < 600 && seen.insert(key).second) {
             LOG_INFO(HW_GPU, "nx2 draw target {:#x} {}x{} format={:#x} vs={:#x} ps={:#x} blend={} (pairs so far {})",
                      rt.Address(), rt.width, rt.height, static_cast<u32>(rt.format), vs, ps,
                      regs.blend.enable[0], seen.size());
-            // TEMP-FE-TRACE: pixel-stage constant buffer 3 (the pass's user constants).
-            if (const auto& cb3 = maxwell3d->state.shader_stages[4].const_buffers[3]; cb3.enabled) {
-                std::array<f32, 12> values{};
-                gpu_memory->ReadBlockUnsafe(cb3.address, values.data(), sizeof(values));
-                LOG_INFO(HW_GPU, "  c[3]@{:#x} size={}: {}", cb3.address, cb3.size, fmt::join(values, " "));
-            }
-            // TEMP-FE-TRACE: the images the pixel shader samples (bound buffer 2 handles).
-            // TEMP-FE-TRACE: the buffer selected for inline uploads (CB_ADDRESS), a bank 24 candidate.
-            {
-                std::array<f32, 12> values{};
-                gpu_memory->ReadBlockUnsafe(regs.const_buffer.Address(), values.data(), sizeof(values));
-                LOG_INFO(HW_GPU, "  CB_ADDRESS {:#x} size {:#x} offset {:#x}: {}", regs.const_buffer.Address(),
-                         regs.const_buffer.size, regs.const_buffer.offset, fmt::join(values, " "));
-            }
-            const auto& handles = maxwell3d->state.shader_stages[4].const_buffers[2];
-            LOG_INFO(HW_GPU, "  c[2] enabled={} address={:#x} size={:#x} handle0={:#x}", handles.enabled,
-                     handles.address, handles.size,
-                     handles.enabled ? gpu_memory->Read<u32>(handles.address + 0x20) : 0U);
-            for (u32 i = 0; handles.enabled && i < 8; ++i) {
-                const u32 handle = gpu_memory->Read<u32>(handles.address + 0x20 + i * 4);
-                if (handle == 0 || handle == 0xffffffff) continue;
-                Tegra::Texture::TICEntry tic{};
-                gpu_memory->ReadBlockUnsafe(regs.tex_header.Address() + u64{handle & 0xfffff} * sizeof(tic),
-                                            &tic, sizeof(tic));
-                LOG_INFO(HW_GPU, "  samples [{}] {:#x}: {:#x} {}x{} format {:#x} tic0 {:016x}", i, handle,
-                         tic.Address(), tic.Width(), tic.Height(), static_cast<u32>(tic.format.Value()),
-                         tic.raw[0]);
-            }
-            // TEMP-FE-TRACE: bank 7 (native shaders' per-material texture bank), word by word.
-            const auto& bank7 = maxwell3d->state.shader_stages[4].const_buffers[7];
-            for (u32 i = 0; bank7.enabled && i < 8; ++i) {
-                const u32 handle = gpu_memory->Read<u32>(bank7.address + i * 4);
-                Tegra::Texture::TICEntry tic{};
-                gpu_memory->ReadBlockUnsafe(regs.tex_header.Address() + u64{handle & 0xfffff} * sizeof(tic),
-                                            &tic, sizeof(tic));
-                LOG_INFO(HW_GPU, "  c[7]+{:#x} = {:#x}: {:#x} {}x{} format {:#x} tic0 {:016x}", i * 4, handle,
-                         tic.Address(), tic.Width(), tic.Height(), static_cast<u32>(tic.format.Value()),
-                         tic.raw[0]);
-            }
         }
     }
     PrepareDraw(is_indexed, [this, is_indexed, instance_count] {
@@ -944,18 +755,6 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     gpu_memory->FlushCaching();
 
     auto& regs = maxwell3d->regs;
-    // TEMP-FE-TRACE EDEN_NX2_DEBUG_CLEAR=<hex address>: clear that colour target to magenta, to
-    // find where a black frame starts.
-    // "window" matches every 3840-wide target.
-    if (static const u64 debug_clear = [] {
-            const char* text = std::getenv("EDEN_NX2_DEBUG_CLEAR");
-            if (text && std::string_view{text} == "window") return ~0ULL;
-            return text ? std::strtoull(text, nullptr, 16) : 0ULL;
-        }();
-        debug_clear != 0 && (regs.rt[0].Address() == debug_clear ||
-                             (debug_clear == ~0ULL && regs.rt[0].width == 3840))) {
-        regs.clear_color = {1.0f, 0.0f, 1.0f, 1.0f};
-    }
     const bool use_color = regs.clear_surface.R || regs.clear_surface.G || regs.clear_surface.B ||
                            regs.clear_surface.A;
     const bool use_depth = regs.clear_surface.Z;
@@ -1556,98 +1355,16 @@ std::optional<FramebufferTextureInfo> RasterizerVulkan::AccelerateDisplay(
     if (!framebuffer_addr) {
         return {};
     }
-    // TEMP-FE-TRACE EDEN_NX2_FLUSH_GPU=<hex gpu address>,...: write those images back to guest
-    // memory every frame (does the CPU read GPU-computed values from them?).
-    if (static const std::vector<GPUVAddr> flush_list = [] {
-            std::vector<GPUVAddr> list;
-            if (const char* text = std::getenv("EDEN_NX2_FLUSH_GPU")) {
-                for (char* end = nullptr; *text; text = *end ? end + 1 : end) {
-                    list.push_back(std::strtoull(text, &end, 16));
-                    if (end == text) break;
-                }
-            }
-            return list;
-        }();
-        !flush_list.empty()) {
-        for (const GPUVAddr address : flush_list) {
-            if (const auto cpu = gpu_memory->GpuToCpuAddress(address)) {
-                FlushRegion(*cpu, 0x1000);
-            }
-        }
-        if (static u32 flushes{}; flushes++ % 600 == 0) {
-            std::array<u32, 4> guest{};
-            gpu_memory->ReadBlockUnsafe(flush_list.front(), guest.data(), sizeof(guest));
-            LOG_INFO(HW_GPU, "nx2 flushed {:#x} guest: {:08x}", flush_list.front(), fmt::join(guest, " "));
-        }
-    }
     std::scoped_lock lock{texture_cache.mutex};
     const auto [image_view, scaled] =
         texture_cache.TryFindFramebufferImageView(config, framebuffer_addr);
     static u32 display_trace_count{};
     static const bool frame_capture = std::getenv("EDEN_NATIVE_FRAME_CAPTURE") != nullptr;
-    // TEMP-FE-TRACE: also sample later frames, with the found view's size and format.
-    if (frame_capture && (display_trace_count < 64 || display_trace_count % 300 == 0)) {
-        LOG_INFO(HW_GPU, "Native display source: address={:#x}, offset={:#x}, dimensions={}x{}, stride={}, accelerated={}, mask={:#x} view={}x{} fmt={} scaled={}",
+    if (frame_capture && display_trace_count++ < 64) {
+        LOG_INFO(HW_GPU, "Native display source: address={:#x}, offset={:#x}, dimensions={}x{}, stride={}, accelerated={}, mask={:#x}",
                  framebuffer_addr, config.offset, config.width, config.height, pixel_stride,
-                 image_view != nullptr, config.layer_stack_mask,
-                 image_view ? image_view->size.width : 0, image_view ? image_view->size.height : 0,
-                 image_view ? static_cast<u32>(image_view->format) : 0, scaled);
+                 image_view != nullptr, config.layer_stack_mask);
     }
-    // TEMP-FE-TRACE EDEN_NX2_DUMP_RT=<display count>,<hex gpu address>,...: at that display, write
-    // the host contents of the displayed image and of each listed render target to the
-    // EDEN_NX2_FRAME_CAPTURE directory.
-    if (static const std::string spec = [] {
-            const char* text = std::getenv("EDEN_NX2_DUMP_RT");
-            return text ? std::string{text} : std::string{};
-        }();
-        !spec.empty() && display_trace_count == std::strtoul(spec.c_str(), nullptr, 10)) {
-        const char* const capture_dir = std::getenv("EDEN_NX2_FRAME_CAPTURE");
-        const std::string dir = capture_dir ? capture_dir : ".";
-        texture_cache.DebugDumpImages(framebuffer_addr, fmt::format("{}/display", dir));
-        for (size_t pos = spec.find(','); pos != std::string::npos; pos = spec.find(',', pos + 1)) {
-            const GPUVAddr address = std::strtoull(spec.c_str() + pos + 1, nullptr, 16);
-            if (const auto cpu = gpu_memory->GpuToCpuAddress(address)) {
-                texture_cache.DebugDumpImages(*cpu, fmt::format("{}/rt-{:x}", dir, address));
-            }
-        }
-    }
-    // TEMP-FE-TRACE: a file named dump-now in the EDEN_NX2_DUMP_DIR directory dumps the
-    // displayed image and the render targets listed in it (hex GPU addresses, comma-separated),
-    // then is deleted.
-    if (static const char* const capture_dir = std::getenv("EDEN_NX2_DUMP_DIR");
-        capture_dir != nullptr && display_trace_count % 30 == 0) {
-        const std::filesystem::path trigger = std::filesystem::path{capture_dir} / "dump-now";
-        std::error_code error;
-        if (std::filesystem::exists(trigger, error)) {
-            std::string spec;
-            if (std::FILE* file = std::fopen(trigger.string().c_str(), "rb")) {
-                char buffer[4096]{};
-                spec.assign(buffer, std::fread(buffer, 1, sizeof(buffer) - 1, file));
-                std::fclose(file);
-            }
-            std::filesystem::remove(trigger, error);
-            const std::string dir = fmt::format("{}/manual-{}", capture_dir, display_trace_count);
-            std::filesystem::create_directories(dir, error);
-            texture_cache.DebugDumpImages(framebuffer_addr, fmt::format("{}/display", dir));
-            for (size_t pos = 0; pos < spec.size();) {
-                char* end = nullptr;
-                const GPUVAddr address = std::strtoull(spec.c_str() + pos, &end, 16);
-                const size_t next = static_cast<size_t>(end - spec.c_str());
-                if (address != 0) {
-                    std::array<u32, 8> guest{};
-                    gpu_memory->ReadBlockUnsafe(address, guest.data(), sizeof(guest));
-                    LOG_INFO(HW_GPU, "nx2 manual dump guest memory {:#x}: {:08x}", address,
-                             fmt::join(guest, " "));
-                    if (const auto cpu = gpu_memory->GpuToCpuAddress(address)) {
-                        texture_cache.DebugDumpImages(*cpu, fmt::format("{}/rt-{:x}", dir, address));
-                    }
-                }
-                pos = next > pos ? next + 1 : pos + 1;
-            }
-            LOG_INFO(HW_GPU, "nx2 manual dump written to {}", dir);
-        }
-    }
-    ++display_trace_count;
     if (!image_view) {
         return {};
     }

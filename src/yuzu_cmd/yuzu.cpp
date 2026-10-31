@@ -9,9 +9,7 @@
 #include <iterator>
 #include <fstream>
 #include <vector>
-#include <csignal>
 #include <cstdlib>
-#include <exception>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -146,37 +144,6 @@ static LONG WINAPI WriteCrashDump(EXCEPTION_POINTERS* exception) {
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
-
-// With EDEN_NX2_CRASH_DUMP set: a C++ exception escaping a thread, or abort(), ends the process
-// without reaching the exception filter above; print the exception and the stack for those too.
-static void PrintStack(const char* why) {
-    std::fprintf(stderr, "%s on thread %lu\n", why, GetCurrentThreadId());
-    void* frames[48];
-    const USHORT count = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
-    for (USHORT i = 0; i < count; ++i) {
-        PrintCodeAddress("frame", frames[i]);
-    }
-    std::fflush(stderr);
-}
-
-static void OnTerminate() {
-    if (const auto exception = std::current_exception()) {
-        try {
-            std::rethrow_exception(exception);
-        } catch (const std::exception& e) {
-            std::fprintf(stderr, "Unhandled C++ exception: %s\n", e.what());
-        } catch (...) {
-            std::fprintf(stderr, "Unhandled C++ exception of unknown type\n");
-        }
-    }
-    PrintStack("std::terminate");
-    std::_Exit(3);
-}
-
-static void OnAbortSignal(int) {
-    PrintStack("abort()");
-    std::_Exit(3);
-}
 #endif
 
 static void OnStateChanged(const Network::RoomMember::State& state) {
@@ -284,10 +251,6 @@ struct SdlState {
 extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 #ifdef _WIN32
     SetUnhandledExceptionFilter(WriteCrashDump);
-    if (std::getenv("EDEN_NX2_CRASH_DUMP") != nullptr) {
-        std::set_terminate(OnTerminate);
-        std::signal(SIGABRT, OnAbortSignal);
-    }
 #endif
     Nx2Sampler::StartFromEnvironment();
     // SDL calls SDL_AppIterate back to back by default, which kept a host core at 100% polling

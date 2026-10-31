@@ -11,6 +11,10 @@ set "PATH=%ProgramFiles%\Git\cmd;%ProgramFiles%\Git\usr\bin;%PATH%"
 
 git -C "%SRC%" submodule update --init --recursive || exit /b 1
 
+rem Set GLSLANG_VALIDATOR to a glslangValidator.exe if CMake can't find one (the Vulkan SDK has it).
+set "GLSLANG_ARG="
+if defined GLSLANG_VALIDATOR set "GLSLANG_ARG=-DGLSLANGVALIDATOR=%GLSLANG_VALIDATOR%"
+
 "%ProgramFiles%\CMake\bin\cmake.exe" -S "%SRC%" -B "%BUILD_DIR%" -G Ninja ^
     "-DCMAKE_MAKE_PROGRAM:FILEPATH=%NINJA_EXE%" ^
     -DCMAKE_C_COMPILER=cl.exe -DCMAKE_CXX_COMPILER=cl.exe ^
@@ -20,7 +24,7 @@ git -C "%SRC%" submodule update --init --recursive || exit /b 1
     -DENABLE_CUBEB=OFF -DENABLE_RESHADE=OFF ^
     -DENABLE_OPENGL=OFF -DENABLE_WEB_SERVICE=OFF ^
     -DENABLE_LTO=OFF -DYUZU_DISABLE_LLVM=ON -DENABLE_WERROR=OFF ^
-    "-DGLSLANGVALIDATOR=%LOCALAPPDATA%\Android\Sdk\emulator\lib64\vulkan\glslangValidator.exe" || exit /b 1
+    %GLSLANG_ARG% || exit /b 1
 
 "%ProgramFiles%\CMake\bin\cmake.exe" --build "%BUILD_DIR%" --target yuzu-cmd --parallel %NUMBER_OF_PROCESSORS% || exit /b 1
 echo BUILD OK
